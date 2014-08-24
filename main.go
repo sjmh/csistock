@@ -8,14 +8,21 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
 type Product struct {
-	Name  string
-	Url   string
-	Stock int
+	Name         string
+	Url          string
+	CurrentStock int
+	OldStock     int
+	Alerted      int64
+}
+
+type Products struct {
+	Items map[string]*Product
 }
 
 type UserEnv struct {
@@ -32,16 +39,13 @@ var (
 	boxcar_url = "https://new.boxcar.io/api/notifications"
 )
 
-func main() {
-	userenv, err := getUserEnv()
-	if err != nil {
-		log.Fatal("Could not get user environment: ", err)
+func deleteOld(p *Products, np *Products) *Products {
+	for k, _ := range p.Items {
+		if _, ok := np.Items[k]; !ok {
+			delete(p.Items, k)
+		}
 	}
-	products := getProducts(userenv.Wishlist)
-	msg := getMessage(products)
-	if msg != "" {
-		alert(userenv.Token, msg)
-	}
+	return p
 }
 
 func getUserEnv() (*UserEnv, error) {
@@ -58,10 +62,10 @@ func getUserEnv() (*UserEnv, error) {
 	return &userenv, nil
 }
 
-func getProducts(wishlist_url string) []*Product {
+func getProducts(wishlist_url string) *Products {
 	var doc *goquery.Document
 	var e error
-	var products []*Product
+	products := &Products{Items: make(map[string]*Product)}
 
 	if doc, e = goquery.NewDocument(wishlist_url); e != nil {
 		log.Fatal(e)
@@ -83,7 +87,7 @@ func getProducts(wishlist_url string) []*Product {
 	for {
 		select {
 		case product := <-jobs:
-			products = append(products, product)
+			products.Items[product.Name] = product
 		case <-done:
 			pages_done++
 			if pages_done == num_pages {
@@ -93,14 +97,11 @@ func getProducts(wishlist_url string) []*Product {
 	}
 }
 
-func getMessage(products []*Product) string {
-	var msg string
-	for p := range products {
-		if products[p].Stock < 6 && products[p].Stock > 0 {
-			msg = msg + fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is low on stock! Only <strong>%d</strong> left.</p>", products[p].Url, products[p].Name, products[p].Stock)
-		}
+func timePassed(alerted int64) bool {
+	if time_since := time.Now().Unix() - alerted; time_since < 86400 {
+		return false
 	}
-	return msg
+	return true
 }
 
 func setPost(token string, msg string) *url.Values {
@@ -113,7 +114,7 @@ func setPost(token string, msg string) *url.Values {
 	return &data
 }
 
-func alert(token string, msg string) {
+func sendAlert(token string, msg string) {
 	data := setPost(token, msg)
 	_, err := http.PostForm(boxcar_url, *data)
 	if err != nil {
@@ -130,37 +131,38 @@ func pageParser(job chan *Product, done chan bool, purl string) {
 	}
 
 	doc.Find("[pid]").Each(func(i int, s *goquery.Selection) {
-		p := Product{}
+		p := new(Product)
 		link := s.Find("h3").Find("a").First()
 		p.Name = link.Text()
 		p.Url, _ = link.Attr("href")
-		p.Stock, e = getStock(s.Find(".stockStatus").Text())
+		p.CurrentStock, e = getStock(s.Find(".stockStatus").Text())
 		if e != nil {
 			fmt.Printf("Could not find stock for '%s' - %s\n", p.Name, e)
 		} else {
-			if shouldAlert(s) {
-				job <- &p
-			}
+			job <- p
 		}
 	})
 	done <- true
 }
 
-func shouldAlert(s *goquery.Selection) bool {
-	qty, _ := regexp.Compile("Wishing for ([0-9]+) of these")
-	wish_qty := s.Find(".qtyDesired").Text()
-
-	if m := qty.FindStringSubmatch(wish_qty); m != nil {
-		if m[1] == "99" {
-			return false
+func shouldAlert(p *Product) string {
+	if p.OldStock == -1 && p.CurrentStock < 0 {
+		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is now available for pre-order!</p>", p.Url, p.Name)
+	} else if p.OldStock == 0 && p.CurrentStock < 0 {
+		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is now available for ordering!</p>", p.Url, p.Name)
+	} else if p.CurrentStock > 0 && p.CurrentStock < 6 {
+		if p.CurrentStock < p.OldStock || timePassed(p.Alerted) {
+			return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> has only <strong>%d</strong> copies left.</p>", p.Url, p.Name, p.CurrentStock)
 		}
-		return true
+	} else if p.CurrentStock == 0 && p.OldStock != 0 {
+		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is now out of stock.</p>", p.Url, p.Name)
 	}
-	return true
+	return ""
 }
 
 func getStock(stock string) (int, error) {
-	outstock, _ := regexp.Compile("(Out of stock|Pre-order)")
+	outstock, _ := regexp.Compile("Out of stock")
+	preorder, _ := regexp.Compile("Pre-order")
 	lowstock, _ := regexp.Compile("Only ([0-9]) left in stock")
 	instock, _ := regexp.Compile(`([0-9]+)\+? in stock`)
 	matches := []string{}
@@ -168,6 +170,8 @@ func getStock(stock string) (int, error) {
 	switch {
 	case outstock.Match([]byte(stock)):
 		return 0, nil
+	case preorder.Match([]byte(stock)):
+		return -1, nil
 	case lowstock.Match([]byte(stock)):
 		matches = lowstock.FindStringSubmatch(stock)
 	case instock.Match([]byte(stock)):
@@ -179,4 +183,34 @@ func getStock(stock string) (int, error) {
 	}
 
 	return -1, fmt.Errorf("No match found for '%s'", stock)
+}
+
+func main() {
+	userenv, err := getUserEnv()
+	if err != nil {
+		log.Fatal("Could not get user environment: ", err)
+	}
+	products := &Products{Items: make(map[string]*Product)}
+	var msg string
+	for {
+		nproducts := getProducts(userenv.Wishlist)
+		for npName, np := range nproducts.Items {
+			if _, ok := products.Items[npName]; !ok {
+				products.Items[npName] = np
+			}
+			p := products.Items[npName]
+			p.OldStock = p.CurrentStock
+			p.CurrentStock = np.CurrentStock
+			if alert := shouldAlert(p); alert != "" {
+				p.Alerted = time.Now().Unix()
+				msg += alert
+			}
+		}
+		products = deleteOld(products, nproducts)
+		if msg != "" {
+			sendAlert(userenv.Token, msg)
+			msg = ""
+		}
+		time.Sleep(time.Minute * 5)
+	}
 }
