@@ -146,17 +146,20 @@ func pageParser(job chan *Product, done chan bool, purl string) {
 }
 
 func shouldAlert(p *Product) string {
-	if p.OldStock == -1 && p.CurrentStock < 0 {
-		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is now available for pre-order!</p>", p.Url, p.Name)
-	} else if p.OldStock == 0 && p.CurrentStock < 0 {
-		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is now available for ordering!</p>", p.Url, p.Name)
-	} else if p.CurrentStock > 0 && p.CurrentStock < 6 {
-		if p.CurrentStock < p.OldStock || timePassed(p.Alerted) {
-			return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> has only <strong>%d</strong> copies left.</p>", p.Url, p.Name, p.CurrentStock)
-		}
+	if p.CurrentStock == -1 && p.OldStock != -1 {
+		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> now has <strong>%d</strong> copies available for pre-order!</p>", p.Url, p.Name, p.CurrentStock)
+	} else if p.CurrentStock > 0 && p.OldStock <= 0 {
+		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> now has <strong>%d</strong> copies available for ordering!</p>", p.Url, p.Name, p.CurrentStock)
 	} else if p.CurrentStock == 0 && p.OldStock != 0 {
 		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is now out of stock.</p>", p.Url, p.Name)
+	} else if p.CurrentStock > 0 && p.CurrentStock < 6 {
+		if p.CurrentStock < p.OldStock {
+			return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> has <strong>%d</strong> (was %d) copies left.</p>", p.Url, p.Name, p.CurrentStock, p.OldStock)
+		} else if timePassed(p.Alerted) {
+			return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> has <strong>%d</strong> copies left.</p>", p.Url, p.Name, p.CurrentStock)
+		}
 	}
+
 	return ""
 }
 
