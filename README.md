@@ -1,6 +1,6 @@
 
-CSI Stock Checker
------------------
+CSI Stock Checker v.1.0.0
+--------------------------
 
 This is a simple script for page scraping the http://www.coolstuffinc.com site for your wishlist and informing you via Boxcar to your mobile phone when certain events ( low stock, out of stock, back in stock ) occur.
 

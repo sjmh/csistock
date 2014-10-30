@@ -16,6 +16,7 @@ import (
 type Product struct {
 	Name         string
 	Url          string
+	Pid          string
 	CurrentStock int
 	OldStock     int
 	Alerted      int64
@@ -32,7 +33,7 @@ type UserEnv struct {
 
 var (
 	notify = map[string]string{
-		"notification[title]":       "Low Stock Alert",
+		//"notification[title]":       "Low Stock Alert",
 		"notification[sound]":       "clanging",
 		"notification[source_name]": "CSI Stock Notifier",
 		"notification[url]":         "http://www.coolstuffinc.com"}
@@ -62,36 +63,55 @@ func getUserEnv() (*UserEnv, error) {
 	return &userenv, nil
 }
 
-func getProducts(wishlist_url string) *Products {
+func getProducts(wishlist_url string) (*Products, error) {
 	var doc *goquery.Document
 	var e error
 	products := &Products{Items: make(map[string]*Product)}
 
+	log.Println("Making query to CSI website")
 	if doc, e = goquery.NewDocument(wishlist_url); e != nil {
-		log.Fatal(e)
+		return nil, e
 	}
 
 	num_pages := 0
 
 	jobs := make(chan *Product)
 	done := make(chan bool)
+	timeout := make(chan bool, 1)
 
+	log.Println("Parsing returned wishlist")
 	pages := doc.Find(".pages").First()
+	if pages.Length() == 0 {
+		return nil, fmt.Errorf("No pages were returned")
+	}
+
+	go func() {
+		time.Sleep(60 * time.Second)
+		timeout <- true
+	}()
+
 	pages.Find("a").Each(func(i int, s *goquery.Selection) {
+		log.Printf("Executing go routine for page %d", i+1)
 		purl := fmt.Sprintf("%s&page=%d", wishlist_url, i+1)
 		go pageParser(jobs, done, purl)
 		num_pages++
 	})
+	if num_pages == 0 {
+		return nil, fmt.Errorf("No pages were parsed from output")
+	}
 
+	log.Println("Waiting for pages to complete parsing")
 	pages_done := 0
 	for {
 		select {
+		case <-timeout:
+			return nil, fmt.Errorf("Timed out while waiting for wishlist to be parsed")
 		case product := <-jobs:
-			products.Items[product.Name] = product
+			products.Items[product.Pid] = product
 		case <-done:
 			pages_done++
 			if pages_done == num_pages {
-				return products
+				return products, nil
 			}
 		}
 	}
@@ -106,6 +126,7 @@ func timePassed(alerted int64) bool {
 
 func setPost(token string, msg string) *url.Values {
 	data := url.Values{}
+	data.Set("notification[title]", msg)
 	data.Set("notification[long_message]", msg)
 	data.Set("user_credentials", token)
 	for k, v := range notify {
@@ -132,6 +153,7 @@ func pageParser(job chan *Product, done chan bool, purl string) {
 
 	doc.Find("[pid]").Each(func(i int, s *goquery.Selection) {
 		p := new(Product)
+		p.Pid, _ = s.Attr("pid")
 		link := s.Find("h3").Find("a").First()
 		p.Name = link.Text()
 		p.Url, _ = link.Attr("href")
@@ -147,19 +169,20 @@ func pageParser(job chan *Product, done chan bool, purl string) {
 
 func shouldAlert(p *Product) string {
 	if p.CurrentStock == -1 && p.OldStock != -1 {
-		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> now has <strong>%d</strong> copies available for pre-order!</p>", p.Url, p.Name, p.CurrentStock)
+		return fmt.Sprintf("%s is available for pre-order", p.Name)
 	} else if p.CurrentStock > 0 && p.OldStock <= 0 {
-		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> now has <strong>%d</strong> copies available for ordering!</p>", p.Url, p.Name, p.CurrentStock)
+		return fmt.Sprintf("%s now has %d copies available", p.Name, p.CurrentStock)
 	} else if p.CurrentStock == 0 && p.OldStock != 0 {
-		return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> is now out of stock.</p>", p.Url, p.Name)
+		return fmt.Sprintf("%s is out of stock", p.Name)
 	} else if p.CurrentStock > 0 && p.CurrentStock < 6 {
 		if p.CurrentStock < p.OldStock {
-			return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> has <strong>%d</strong> (was %d) copies left.</p>", p.Url, p.Name, p.CurrentStock, p.OldStock)
-		} else if timePassed(p.Alerted) {
-			return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> has <strong>%d</strong> copies left.</p>", p.Url, p.Name, p.CurrentStock)
+			return fmt.Sprintf("%s down to %d copies left", p.Name, p.CurrentStock)
 		}
+		// Taking out time based alerting
+		// else if timePassed(p.Alerted) {
+		//	return fmt.Sprintf("<p><strong><a href=\"%s\">%s</a></strong> still has <strong>%d</strong> copies left. (%s)</p>", p.Url, p.Name, p.CurrentStock, time.Unix(p.Alerted, 0))
+		//}
 	}
-
 	return ""
 }
 
@@ -195,23 +218,41 @@ func main() {
 	}
 	products := &Products{Items: make(map[string]*Product)}
 	var msg string
+	f, err := os.Create("csi.log")
+	defer f.Close()
+	log.SetOutput(f)
+	log.SetFlags(3)
+
 	for {
-		nproducts := getProducts(userenv.Wishlist)
-		for npName, np := range nproducts.Items {
-			if _, ok := products.Items[npName]; !ok {
-				products.Items[npName] = np
+		log.Println("Starting run")
+		nproducts, err := getProducts(userenv.Wishlist)
+		if err != nil {
+			log.Printf("Error while getting products: %v\n", err)
+			time.Sleep(time.Minute * 5)
+			continue
+		}
+		log.Println("Parsing products")
+		for pid, np := range nproducts.Items {
+			// if key doesn't exist in products, add it
+			if _, ok := products.Items[pid]; !ok {
+				products.Items[pid] = np
 			}
-			p := products.Items[npName]
+			p := products.Items[pid]
 			p.OldStock = p.CurrentStock
 			p.CurrentStock = np.CurrentStock
 			if alert := shouldAlert(p); alert != "" {
-				p.Alerted = time.Now().Unix()
-				msg += alert
+				// Don't need time.
+				//p.Alerted = time.Now().Unix()
+				sendAlert(userenv.Token, alert)
 			}
 		}
+		log.Println("Deleting old products")
 		products = deleteOld(products, nproducts)
+		log.Println("Printing products")
+		for _, p := range products.Items {
+			log.Printf("%s, %d, %d, %d\n", p.Name, p.OldStock, p.CurrentStock, p.Alerted)
+		}
 		if msg != "" {
-			sendAlert(userenv.Token, msg)
 			msg = ""
 		}
 		time.Sleep(time.Minute * 5)
